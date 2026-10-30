@@ -1,29 +1,47 @@
 const DEFAULT_MODEL = "gemini-3.5-flash-lite";
-const MAX_HISTORY_MESSAGES = 8;
-const MAX_HISTORY_MESSAGE_CHARS = 1200;
+const MAX_HISTORY_MESSAGES = 4;
+const MAX_HISTORY_MESSAGE_CHARS = 200;
 const MAX_ALICE_TEXT = 1024;
+const MAX_SESSION_STATE_BYTES = 900;
 const TOTAL_RESPONSE_BUDGET_MS = 3600;
 const SERPER_TIMEOUT_MS = 600;
 const GEMINI_TIMEOUT_MS = 2500;
 
 const SYSTEM_PROMPT = [
-  "Ты — Джарвис, личный голосовой помощник Александра.",
+  "Ты — Джарвис, личный голосовой помощник Яна.",
   "Отвечай по-русски, уверенно, доброжелательно и кратко.",
-  "Обращайся к пользователю по имени ,Ян, когда  это уместно.",
+  "Обращайся к пользователю по имени Ян, когда это уместно.",
   "Помогай с техническим надзором, строительством, электромонтажом, мотоциклами, бизнесом и поиском актуальной информации.",
   "Если вопрос требует свежих данных и переданы результаты поиска, опирайся на них.",
   "Если не знаешь ответа, честно скажи об этом.",
   "Не используй Markdown, таблицы и длинные вступления — ответ должен быть удобен для голосового общения."
 ].join(" ");
 
+function byteLength(value) {
+  try {
+    return Buffer.byteLength(JSON.stringify(value), "utf8");
+  } catch {
+    return Infinity;
+  }
+}
+
+function trimHistoryToBudget(history) {
+  let result = safeHistory(history);
+  while (result.length && byteLength({ history: result }) > MAX_SESSION_STATE_BYTES) {
+    result = result.slice(1);
+  }
+  return result;
+}
+
 function aliceResponse(text, endSession = false, history = []) {
+  const safe = trimHistoryToBudget(history);
   return {
     version: "1.0",
     response: {
       text: fitAliceText(text),
       end_session: endSession
     },
-    session_state: { history }
+    session_state: { history: safe }
   };
 }
 
@@ -57,6 +75,21 @@ function safeHistory(history) {
     .filter(item => item && (item.role === "user" || item.role === "model") && typeof item.text === "string")
     .slice(-MAX_HISTORY_MESSAGES)
     .map(item => ({ role: item.role, text: item.text.slice(0, MAX_HISTORY_MESSAGE_CHARS) }));
+}
+
+function normalizeHistory(history) {
+  const safe = safeHistory(history);
+  while (safe.length && safe[0].role !== "user") safe.shift();
+  const result = [];
+  for (const item of safe) {
+    const last = result[result.length - 1];
+    if (last && last.role === item.role) {
+      last.text = (last.text + " " + item.text).slice(0, MAX_HISTORY_MESSAGE_CHARS);
+    } else {
+      result.push({ role: item.role, text: item.text });
+    }
+  }
+  return result;
 }
 
 async function fetchJson(url, options, timeoutMs) {
@@ -120,7 +153,7 @@ async function askGemini(text, history, searchContext, timeoutMs) {
   const model = String(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim();
   if (!/^[A-Za-z0-9._-]+$/.test(model)) throw new Error("INVALID_MODEL_NAME");
 
-  const contents = safeHistory(history).map(item => ({
+  const contents = normalizeHistory(history).map(item => ({
     role: item.role,
     parts: [{ text: item.text }]
   }));
@@ -143,7 +176,7 @@ async function askGemini(text, history, searchContext, timeoutMs) {
         contents,
         generationConfig: {
           temperature: 0.5,
-          maxOutputTokens: 240
+          maxOutputTokens: 400
         }
       })
     },
@@ -152,9 +185,10 @@ async function askGemini(text, history, searchContext, timeoutMs) {
 
   if (!response.ok) {
     const status = Number(response.status);
-    console.error("Gemini request failed with HTTP", status);
+    console.error("Gemini request failed with HTTP", status, JSON.stringify(data).slice(0, 500));
     if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
     if (status === 429) throw new Error("GEMINI_QUOTA");
+    if (status === 400) throw new Error("GEMINI_BAD_REQUEST");
     throw new Error("GEMINI_REQUEST_FAILED");
   }
 
@@ -184,6 +218,8 @@ function errorForUser(error) {
       return "Сейчас превышен лимит запросов к Gemini. Попробуйте немного позже.";
     case "GEMINI_BLOCKED":
       return "Я не смогла обработать этот запрос. Попробуйте спросить иначе.";
+    case "GEMINI_BAD_REQUEST":
+      return "Нейросеть отклонила запрос из-за формата. Проверьте логи Vercel.";
     case "TIME_BUDGET_EXHAUSTED":
     case "AbortError":
       return "Не успела подготовить ответ. Попробуйте задать вопрос ещё раз, чуть короче.";
@@ -223,7 +259,6 @@ export default async function handler(req, res) {
   try {
     let searchContext = "";
     if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
-      // Search has a very short budget because Alice expects a response within 4.5 seconds.
       searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
     }
 
@@ -234,11 +269,11 @@ export default async function handler(req, res) {
       Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 600))
     );
 
-    const history = [
+    const history = normalizeHistory([
       ...oldHistory,
       { role: "user", text: text.slice(0, MAX_HISTORY_MESSAGE_CHARS) },
       { role: "model", text: answer.slice(0, MAX_HISTORY_MESSAGE_CHARS) }
-    ].slice(-MAX_HISTORY_MESSAGES);
+    ].slice(-MAX_HISTORY_MESSAGES));
 
     return res.status(200).json(aliceResponse(answer, false, history));
   } catch (error) {
@@ -248,4 +283,4 @@ export default async function handler(req, res) {
   }
 }
 
-export { aliceResponse, fitAliceText, isSearchIntent, safeHistory };
+export { aliceResponse, fitAliceText, isSearchIntent, safeHistory, normalizeHistory, trimHistoryToBudget };
