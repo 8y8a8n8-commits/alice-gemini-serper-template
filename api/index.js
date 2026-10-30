@@ -7,15 +7,24 @@ const TOTAL_RESPONSE_BUDGET_MS = 3600;
 const SERPER_TIMEOUT_MS = 600;
 const GEMINI_TIMEOUT_MS = 2500;
 
-const SYSTEM_PROMPT = [
-  "Ты — Джарвис, личный голосовой помощник Яна.",
-  "Отвечай по-русски, уверенно, доброжелательно и кратко.",
-  "Обращайся к пользователю по имени Ян, когда это уместно.",
-  "Помогай с техническим надзором, строительством, электромонтажом, мотоциклами, бизнесом и поиском актуальной информации.",
-  "Если вопрос требует свежих данных и переданы результаты поиска, опирайся на них.",
-  "Если не знаешь ответа, честно скажи об этом.",
-  "Не используй Markdown, таблицы и длинные вступления — ответ должен быть удобен для голосового общения."
-].join(" ");
+const SYSTEM_PROMPT = `
+<role>
+Ты — Джарвис, голосовой помощник Яна. Отвечай кратко, уверенно, доброжелательно.
+</role>
+
+<constraints>
+1. Ты общаешься голосом. Ответ должен легко произноситься: без Markdown, таблиц, списков и скобок.
+2. Если передан контекст поиска — опирайся только на него. Если ответа там нет — честно скажи, что не знаешь.
+3. Ты не выдумываешь факты. Если не уверен — признайся.
+4. Обращайся к пользователю по имени Ян, когда это уместно.
+</constraints>
+
+<knowledge>
+Твои знания ограничены. Текущий год: 2026. Если вопрос о свежих событиях — используй результаты поиска.
+</knowledge>
+`;
+
+const HELP_TEXT = "Я умею отвечать на вопросы, искать актуальную информацию в интернете, помогать с техническим надзором, строительством, электромонтажом, мотоциклами и бизнесом. Просто спроси или скажи «найди» и что нужно.";
 
 function byteLength(value) {
   try {
@@ -65,8 +74,14 @@ function fitAliceText(value) {
   return (lastSpace > 200 ? candidate.slice(0, lastSpace) : candidate).trim() + "…";
 }
 
-function isSearchIntent(text) {
-  return /\b(latest|today|current|news|weather|price|exchange rate|recent|search|look up)\b|сегодня|сейчас|последн|новост|погод|курс валют|найди|поищи|актуальн|сколько стоит|свежие данные/i.test(text);
+// Интент читается из request.nlu.intents.search, а не из регулярки
+function hasSearchIntent(body) {
+  const intents = body?.request?.nlu?.intents;
+  return Boolean(intents && intents.search);
+}
+
+function isHelpRequest(text) {
+  return /^(помощь|помоги|что ты умеешь|что можешь|твои возможности)$/i.test(text.trim());
 }
 
 function safeHistory(history) {
@@ -192,6 +207,12 @@ async function askGemini(text, history, searchContext, timeoutMs) {
     throw new Error("GEMINI_REQUEST_FAILED");
   }
 
+  // Логируем расход токенов для контроля бюджета
+  const usage = data?.usageMetadata;
+  if (usage) {
+    console.log("Gemini usage:", JSON.stringify(usage));
+  }
+
   const candidate = data?.candidates?.[0];
   const answer = (candidate?.content?.parts || [])
     .map(part => typeof part.text === "string" ? part.text : "")
@@ -256,9 +277,14 @@ export default async function handler(req, res) {
     ));
   }
 
+  // Обработка запроса помощи — без вызова Gemini
+  if (isHelpRequest(text)) {
+    return res.status(200).json(aliceResponse(HELP_TEXT, false, oldHistory));
+  }
+
   try {
     let searchContext = "";
-    if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
+    if (hasSearchIntent(body) && process.env.SERPER_API_KEY) {
       searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
     }
 
@@ -283,4 +309,4 @@ export default async function handler(req, res) {
   }
 }
 
-export { aliceResponse, fitAliceText, isSearchIntent, safeHistory, normalizeHistory, trimHistoryToBudget };
+export { aliceResponse, fitAliceText, safeHistory, normalizeHistory, trimHistoryToBudget };
