@@ -1,4 +1,9 @@
 const DEFAULT_MODEL = "gemini-3.5-flash-lite";
+const FALLBACK_MODELS = [
+  "gemini-3.5-flash-lite",
+  "gemini-2.5-flash",
+  "gemini-2.0-flash"
+];
 const MAX_HISTORY_MESSAGES = 4;
 const MAX_HISTORY_MESSAGE_CHARS = 200;
 const MAX_ALICE_TEXT = 1024;
@@ -74,7 +79,6 @@ function fitAliceText(value) {
   return (lastSpace > 200 ? candidate.slice(0, lastSpace) : candidate).trim() + "…";
 }
 
-// Интент читается из request.nlu.intents.search, а не из регулярки
 function hasSearchIntent(body) {
   const intents = body?.request?.nlu?.intents;
   return Boolean(intents && intents.search);
@@ -160,13 +164,20 @@ async function searchWeb(query, timeoutMs) {
   }
 }
 
+function buildModelChain() {
+  const envModel = String(process.env.GEMINI_MODEL || "").trim();
+  const chain = [];
+  if (envModel && /^[A-Za-z0-9._-]+$/.test(envModel)) chain.push(envModel);
+  for (const m of FALLBACK_MODELS) {
+    if (/^[A-Za-z0-9._-]+$/.test(m) && !chain.includes(m)) chain.push(m);
+  }
+  return chain;
+}
+
 async function askGemini(text, history, searchContext, timeoutMs) {
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new Error("MISSING_GEMINI_KEY");
   if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
-
-  const model = String(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim();
-  if (!/^[A-Za-z0-9._-]+$/.test(model)) throw new Error("INVALID_MODEL_NAME");
 
   const contents = normalizeHistory(history).map(item => ({
     role: item.role,
@@ -178,55 +189,81 @@ async function askGemini(text, history, searchContext, timeoutMs) {
     : text;
   contents.push({ role: "user", parts: [{ text: prompt }] });
 
-  const { response, data } = await fetchJson(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-goog-api-key": key
-      },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-        contents,
-        generationConfig: {
-          temperature: 0.5,
-          maxOutputTokens: 400
+  const models = buildModelChain();
+  let lastStatus = null;
+
+  for (const model of models) {
+    if (timeoutMs < 250) break;
+
+    try {
+      const { response, data } = await fetchJson(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-goog-api-key": key
+          },
+          body: JSON.stringify({
+            systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+            contents,
+            generationConfig: {
+              temperature: 0.5,
+              maxOutputTokens: 400
+            }
+          })
+        },
+        Math.min(GEMINI_TIMEOUT_MS, timeoutMs)
+      );
+
+      const status = Number(response.status);
+
+      if (response.ok) {
+        const usage = data?.usageMetadata;
+        if (usage) console.log(`Gemini usage (${model}):`, JSON.stringify(usage));
+
+        const candidate = data?.candidates?.[0];
+        const answer = (candidate?.content?.parts || [])
+          .map(part => typeof part.text === "string" ? part.text : "")
+          .join("")
+          .trim();
+
+        if (answer) {
+          console.log(`Gemini succeeded with model: ${model}`);
+          return answer;
         }
-      })
-    },
-    Math.min(GEMINI_TIMEOUT_MS, timeoutMs)
-  );
 
-  if (!response.ok) {
-    const status = Number(response.status);
-    console.error("Gemini request failed with HTTP", status, JSON.stringify(data).slice(0, 500));
-    if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
-    if (status === 429) throw new Error("GEMINI_QUOTA");
-    if (status === 400) throw new Error("GEMINI_BAD_REQUEST");
-    throw new Error("GEMINI_REQUEST_FAILED");
+        if (data?.promptFeedback?.blockReason) throw new Error("GEMINI_BLOCKED");
+        console.warn(`Model ${model} returned empty response; trying next.`);
+        lastStatus = "empty";
+        continue;
+      }
+
+      console.warn(`Model ${model} failed with HTTP ${status}`);
+      lastStatus = status;
+
+      if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
+      if (status === 400) throw new Error("GEMINI_BAD_REQUEST");
+
+      // 429 и 5xx — повод попробовать следующую модель
+      if (status === 429 || status >= 500) continue;
+
+      // Прочие статусы — не имеет смысла перебирать модели
+      throw new Error("GEMINI_REQUEST_FAILED");
+
+    } catch (err) {
+      if (err.name === "AbortError") {
+        console.warn(`Model ${model} timed out; trying next if budget allows.`);
+        lastStatus = "timeout";
+        continue;
+      }
+      throw err;
+    }
   }
 
-  // Логируем расход токенов для контроля бюджета
-  const usage = data?.usageMetadata;
-  if (usage) {
-    console.log("Gemini usage:", JSON.stringify(usage));
-  }
-
-  const candidate = data?.candidates?.[0];
-  const answer = (candidate?.content?.parts || [])
-    .map(part => typeof part.text === "string" ? part.text : "")
-    .join("")
-    .trim();
-
-  if (!answer) {
-    if (data?.promptFeedback?.blockReason) throw new Error("GEMINI_BLOCKED");
-    throw new Error("GEMINI_EMPTY_RESPONSE");
-  }
-  if (candidate?.finishReason === "MAX_TOKENS") {
-    console.warn("Gemini reached the output token limit.");
-  }
-  return answer;
+  if (lastStatus === 429) throw new Error("GEMINI_QUOTA");
+  if (lastStatus === "timeout") throw new Error("TIME_BUDGET_EXHAUSTED");
+  throw new Error("GEMINI_REQUEST_FAILED");
 }
 
 function errorForUser(error) {
@@ -236,7 +273,7 @@ function errorForUser(error) {
     case "GEMINI_KEY_REJECTED":
       return "Не удалось подключиться к Gemini. Проверьте API-ключ в настройках Vercel.";
     case "GEMINI_QUOTA":
-      return "Сейчас превышен лимит запросов к Gemini. Попробуйте немного позже.";
+      return "Сейчас превышен лимит запросов ко всем моделям Gemini. Попробуйте немного позже.";
     case "GEMINI_BLOCKED":
       return "Я не смогла обработать этот запрос. Попробуйте спросить иначе.";
     case "GEMINI_BAD_REQUEST":
@@ -277,7 +314,6 @@ export default async function handler(req, res) {
     ));
   }
 
-  // Обработка запроса помощи — без вызова Gemini
   if (isHelpRequest(text)) {
     return res.status(200).json(aliceResponse(HELP_TEXT, false, oldHistory));
   }
