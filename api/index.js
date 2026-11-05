@@ -140,9 +140,11 @@ function isHelpRequest(text) {
 }
 
 function quickAnswer(text) {
-  const q = cleanText(text).toLowerCase();
+  const q = cleanText(text).toLowerCase().replace(/[?!.,]+$/g, "").trim();
   if (/^(кто ты|ты кто|как тебя зовут)$/.test(q)) return "Я Джарвис, твой персональный помощник. Я умею отвечать на вопросы, искать свежую информацию и помогать тебе с рабочими и бытовыми задачами.";
   if (/^(где я|где я нахожусь|мой город|в каком я городе)$/.test(q)) return "Ты находишься в Севастополе.";
+  if (/^(кто я|как меня зовут|что ты обо мне знаешь)$/.test(q)) return "Ты Ян. Ты живёшь в Севастополе и работаешь инженером строительного контроля в электромонтажной компании.";
+  if (/^(ты тут|ты здесь|алло|алё|джарвис|джарвис ты тут|слышишь меня|на связи)$/.test(q)) return "Да, Ян, я здесь и слушаю тебя.";
   if (/^(привет|здравствуй|доброе утро|добрый день|добрый вечер)$/.test(q)) return "Привет, Ян. Слушаю тебя.";
   if (/^(спасибо|благодарю)$/.test(q)) return "Пожалуйста, Ян.";
   return "";
@@ -278,7 +280,8 @@ function errorForUser(error) {
     case "GEMINI_QUOTA": return "Превышен лимит Gemini. Попробуйте немного позже.";
     case "GEMINI_BLOCKED": return "Я не смог обработать этот запрос. Скажи иначе.";
     case "TIME_BUDGET_EXHAUSTED": return "Я не успела ответить. Скажи короче или повтори вопрос.";
-    default: return "Не получилось получить ответ. Попробуй ещё раз.";
+    case "GEMINI_REQUEST_FAILED": return "Сейчас не отвечает модуль знаний. Проверьте GEMINI_API_KEY и последний деплой Vercel.";
+    default: return "Сейчас не отвечает внешний сервис. Проверьте настройки ключей в Vercel.";
   }
 }
 
@@ -333,4 +336,4 @@ export default async function handler(req, res) {
   }
 }
 
-export { aliceResponse, fitAliceText, safeHistory, normalizeHistory, trimHistoryToBudget, readSessionHistory };
+export { aliceResponse, fitAliceText, safeHistory, normalizeHistory, trimHistoryToBudget, readSessionHistory, quickAnswer, isWeatherRequest };
