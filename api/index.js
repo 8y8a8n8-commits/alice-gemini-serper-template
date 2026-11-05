@@ -4,47 +4,105 @@ const FALLBACK_MODELS = [
   "gemini-2.5-flash",
   "gemini-2.0-flash"
 ];
-const MAX_HISTORY_MESSAGES = 4;
-const MAX_HISTORY_MESSAGE_CHARS = 200;
+
+// Внутри одной сессии храним последние 3 пары вопрос-ответ.
+// Состояние Алисы ограничено по размеру, поэтому не записываем туда весь диалог.
+const MAX_HISTORY_MESSAGES = 6;
+const MAX_HISTORY_MESSAGE_CHARS = 260;
 const MAX_ALICE_TEXT = 1024;
 const MAX_SESSION_STATE_BYTES = 900;
-const TOTAL_RESPONSE_BUDGET_MS = 3600;
-const SERPER_TIMEOUT_MS = 600;
-const GEMINI_TIMEOUT_MS = 2500;
+const TOTAL_RESPONSE_BUDGET_MS = 4000;
+const SERPER_TIMEOUT_MS = 450;
+const GEMINI_TIMEOUT_MS = 3000;
 
 const SYSTEM_PROMPT = `
 <role>
-Ты — Джарвис, голосовой помощник Яна. Отвечай кратко, уверенно, доброжелательно.
+Ты — Джарвис, персональный голосовой помощник Яна. Отвечай по-русски, кратко, умно и естественно.
 </role>
 
-<constraints>
-1. Ты общаешься голосом. Ответ должен легко произноситься: без Markdown, таблиц, списков и скобок.
-2. Если передан контекст поиска — опирайся только на него. Если ответа там нет — честно скажи, что не знаешь.
-3. Ты не выдумываешь факты. Если не уверен — признайся.
-4. Обращайся к пользователю по имени Ян, когда это уместно.
-</constraints>
+<conversation>
+Всегда учитывай историю диалога. Если пользователь говорит «а он», «а это», «сколько», «почему», «тогда», «продолжи» или задаёт короткий уточняющий вопрос, восстанови, к чему относится реплика, из предыдущих сообщений. Не проси повторить вопрос, если смысл можно восстановить из истории.
+</conversation>
 
-<knowledge>
-Твои знания ограничены. Текущий год: 2026. Если вопрос о свежих событиях — используй результаты поиска.
-</knowledge>
+<voice>
+Ответ предназначен для прослушивания на колонке. Не используй Markdown, таблицы, длинные списки, спецсимволы, скобки и ссылки в ответе. Говори короткими абзацами. Сначала дай прямой ответ, затем важную оговорку или следующий шаг.
+</voice>
+
+<rules>
+Не выдумывай факты. Если передан контекст поиска, используй его только для относящихся к вопросу сведений. Если данных недостаточно, честно скажи об этом. Обращайся к пользователю Ян, когда это естественно.
+</rules>
+
+<profile>
+Пользователь: Ян. Город: Севастополь. Профессия: инженер строительного контроля в электромонтажной компании. Интересы: электрика, строительный контроль, мотоциклы, рыбалка, путешествия, бизнес и ИИ.
+</profile>
 `;
 
-const HELP_TEXT = "Я умею отвечать на вопросы, искать актуальную информацию в интернете, помогать с техническим надзором, строительством, электромонтажом, мотоциклами и бизнесом. Просто спроси или скажи «найди» и что нужно.";
+const HELP_TEXT = "Я умею отвечать на вопросы, искать актуальную информацию, помогать со строительным контролем и электромонтажом, мотоциклами, рыбалкой, путешествиями, бизнесом и ИИ. Можешь спросить меня обычной фразой или сказать: найди информацию о чём-нибудь.";
 
 function byteLength(value) {
-  try {
-    return Buffer.byteLength(JSON.stringify(value), "utf8");
-  } catch {
-    return Infinity;
+  try { return Buffer.byteLength(JSON.stringify(value), "utf8"); }
+  catch { return Infinity; }
+}
+
+function cleanText(value) {
+  return String(value ?? "")
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+function fitAliceText(value) {
+  const text = cleanText(value);
+  if (text.length <= MAX_ALICE_TEXT) return text || "Не удалось подготовить ответ.";
+  const candidate = text.slice(0, MAX_ALICE_TEXT - 1);
+  const sentenceEnd = Math.max(candidate.lastIndexOf(". "), candidate.lastIndexOf("! "), candidate.lastIndexOf("? "));
+  if (sentenceEnd >= 300) return candidate.slice(0, sentenceEnd + 1).trim();
+  const lastSpace = candidate.lastIndexOf(" ");
+  return (lastSpace > 200 ? candidate.slice(0, lastSpace) : candidate).trim() + "…";
+}
+
+function safeHistory(history) {
+  if (!Array.isArray(history)) return [];
+  return history
+    .filter(item => item && (item.role === "user" || item.role === "model") && typeof item.text === "string")
+    .slice(-MAX_HISTORY_MESSAGES)
+    .map(item => ({ role: item.role, text: cleanText(item.text).slice(0, MAX_HISTORY_MESSAGE_CHARS) }));
+}
+
+function normalizeHistory(history) {
+  const source = safeHistory(history);
+  const result = [];
+  for (const item of source) {
+    const last = result[result.length - 1];
+    if (last && last.role === item.role) {
+      last.text = `${last.text} ${item.text}`.slice(0, MAX_HISTORY_MESSAGE_CHARS);
+    } else {
+      result.push({ role: item.role, text: item.text });
+    }
   }
+  while (result.length && result[0].role !== "user") result.shift();
+  return result.slice(-MAX_HISTORY_MESSAGES);
 }
 
 function trimHistoryToBudget(history) {
-  let result = safeHistory(history);
-  while (result.length && byteLength({ history: result }) > MAX_SESSION_STATE_BYTES) {
-    result = result.slice(1);
-  }
+  let result = normalizeHistory(history);
+  while (result.length && byteLength({ history: result }) > MAX_SESSION_STATE_BYTES) result = result.slice(1);
   return result;
+}
+
+// В разных тестах и версиях интеграции состояние может приходить в немного разном виде.
+function readSessionHistory(body) {
+  const candidates = [
+    body?.state?.session?.history,
+    body?.state?.session?.value?.history,
+    body?.state?.session_state?.history,
+    body?.session_state?.history
+  ];
+  for (const candidate of candidates) {
+    const history = safeHistory(candidate);
+    if (history.length) return history;
+  }
+  return [];
 }
 
 function aliceResponse(text, endSession = false, history = []) {
@@ -53,62 +111,28 @@ function aliceResponse(text, endSession = false, history = []) {
     version: "1.0",
     response: {
       text: fitAliceText(text),
+      // text Алиса сама озвучивает на колонке; отдельный tts не нужен.
       end_session: endSession
     },
     session_state: { history: safe }
   };
 }
 
-function fitAliceText(value) {
-  const text = String(value ?? "")
-    .replace(/[\r\n\t]+/g, " ")
-    .replace(/\s{2,}/g, " ")
-    .trim();
-
-  if (text.length <= MAX_ALICE_TEXT) return text || "Не удалось подготовить ответ.";
-
-  const candidate = text.slice(0, MAX_ALICE_TEXT - 1);
-  const sentenceEnd = Math.max(
-    candidate.lastIndexOf(". "),
-    candidate.lastIndexOf("! "),
-    candidate.lastIndexOf("? ")
-  );
-  if (sentenceEnd >= 300) return candidate.slice(0, sentenceEnd + 1).trim();
-
-  const lastSpace = candidate.lastIndexOf(" ");
-  return (lastSpace > 200 ? candidate.slice(0, lastSpace) : candidate).trim() + "…";
-}
-
-function hasSearchIntent(body) {
+function hasSearchIntent(body, text) {
   const intents = body?.request?.nlu?.intents;
-  return Boolean(intents && intents.search);
+  return Boolean((intents && intents.search) || /\b(найди|поищи|проверь|посмотри в интернете|актуальн|свежие новости)\b/i.test(text));
 }
 
 function isHelpRequest(text) {
-  return /^(помощь|помоги|что ты умеешь|что можешь|твои возможности)$/i.test(text.trim());
+  return /^(помощь|помоги|что ты умеешь|что можешь|твои возможности|справка)$/i.test(cleanText(text));
 }
 
-function safeHistory(history) {
-  if (!Array.isArray(history)) return [];
-  return history
-    .filter(item => item && (item.role === "user" || item.role === "model") && typeof item.text === "string")
-    .slice(-MAX_HISTORY_MESSAGES)
-    .map(item => ({ role: item.role, text: item.text.slice(0, MAX_HISTORY_MESSAGE_CHARS) }));
-}
-
-function normalizeHistory(history) {
-  const safe = safeHistory(history);
-  while (safe.length && safe[0].role !== "user") safe.shift();
-  const result = [];
-  for (const item of safe) {
-    const last = result[result.length - 1];
-    if (last && last.role === item.role) {
-      last.text = (last.text + " " + item.text).slice(0, MAX_HISTORY_MESSAGE_CHARS);
-    } else {
-      result.push({ role: item.role, text: item.text });
-    }
-  }
-  return result;
+function quickAnswer(text) {
+  const q = cleanText(text).toLowerCase();
+  if (/^(кто ты|ты кто|как тебя зовут)$/.test(q)) return "Я Джарвис, твой персональный помощник. Я умею отвечать на вопросы, искать свежую информацию и помогать тебе с рабочими и бытовыми задачами.";
+  if (/^(привет|здравствуй|доброе утро|добрый день|добрый вечер)$/.test(q)) return "Привет, Ян. Слушаю тебя.";
+  if (/^(спасибо|благодарю)$/.test(q)) return "Пожалуйста, Ян.";
+  return "";
 }
 
 async function fetchJson(url, options, timeoutMs) {
@@ -118,58 +142,34 @@ async function fetchJson(url, options, timeoutMs) {
     const response = await fetch(url, { ...options, signal: controller.signal });
     const data = await response.json().catch(() => ({}));
     return { response, data };
-  } finally {
-    clearTimeout(timer);
-  }
+  } finally { clearTimeout(timer); }
 }
 
 async function searchWeb(query, timeoutMs) {
   const key = process.env.SERPER_API_KEY;
   if (!key || timeoutMs < 150) return "";
-
   try {
-    const { response, data } = await fetchJson(
-      "https://google.serper.dev/search",
-      {
-        method: "POST",
-        headers: {
-          "X-API-KEY": key,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({ q: query, gl: "ru", hl: "ru", num: 3 })
-      },
-      Math.min(SERPER_TIMEOUT_MS, timeoutMs)
+    const { response, data } = await fetchJson("https://google.serper.dev/search", {
+      method: "POST",
+      headers: { "X-API-KEY": key, "Content-Type": "application/json" },
+      body: JSON.stringify({ q: query, gl: "ru", hl: "ru", num: 3 })
+    }, Math.min(SERPER_TIMEOUT_MS, timeoutMs));
+    if (!response.ok) return "";
+    const items = (Array.isArray(data.organic) ? data.organic : []).slice(0, 3).map((item, i) =>
+      `${i + 1}. ${String(item.title || "").slice(0, 150)}: ${String(item.snippet || "").slice(0, 300)} ${String(item.link || "").slice(0, 220)}`.trim()
     );
-
-    if (!response.ok) {
-      console.warn("Serper request failed with HTTP", response.status);
-      return "";
-    }
-
-    const items = (Array.isArray(data.organic) ? data.organic : [])
-      .slice(0, 3)
-      .map((item, i) => {
-        const title = String(item.title || "").slice(0, 180);
-        const snippet = String(item.snippet || "").slice(0, 350);
-        const link = String(item.link || "").slice(0, 240);
-        return `${i + 1}. ${title}: ${snippet} ${link}`.trim();
-      });
-
     const answerBox = data.answerBox?.answer || data.answerBox?.snippet;
-    if (answerBox) items.unshift(`Краткий ответ поисковика: ${String(answerBox).slice(0, 350)}`);
-    return items.length ? items.join("\n") : "";
-  } catch (error) {
-    console.warn("Serper request did not finish in time; continuing without search.");
-    return "";
-  }
+    if (answerBox) items.unshift(`Краткий ответ поисковика: ${String(answerBox).slice(0, 300)}`);
+    return items.join("\n");
+  } catch { return ""; }
 }
 
 function buildModelChain() {
   const envModel = String(process.env.GEMINI_MODEL || "").trim();
   const chain = [];
   if (envModel && /^[A-Za-z0-9._-]+$/.test(envModel)) chain.push(envModel);
-  for (const m of FALLBACK_MODELS) {
-    if (/^[A-Za-z0-9._-]+$/.test(m) && !chain.includes(m)) chain.push(m);
+  for (const model of [DEFAULT_MODEL, ...FALLBACK_MODELS]) {
+    if (/^[A-Za-z0-9._-]+$/.test(model) && !chain.includes(model)) chain.push(model);
   }
   return chain;
 }
@@ -177,90 +177,46 @@ function buildModelChain() {
 async function askGemini(text, history, searchContext, timeoutMs) {
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new Error("MISSING_GEMINI_KEY");
-  if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
+  if (timeoutMs < 300) throw new Error("TIME_BUDGET_EXHAUSTED");
 
-  const contents = normalizeHistory(history).map(item => ({
-    role: item.role,
-    parts: [{ text: item.text }]
-  }));
-
+  const prior = normalizeHistory(history);
+  const contents = prior.map(item => ({ role: item.role, parts: [{ text: item.text }] }));
   const prompt = searchContext
-    ? `${text}\n\nРезультаты поиска в интернете:\n${searchContext}\nИспользуй их только там, где они относятся к вопросу.`
+    ? `${text}\n\nКонтекст поиска:\n${searchContext}\nИспользуй его только по теме вопроса.`
     : text;
   contents.push({ role: "user", parts: [{ text: prompt }] });
 
-  const models = buildModelChain();
   let lastStatus = null;
-
-  for (const model of models) {
-    if (timeoutMs < 250) break;
-
+  for (const model of buildModelChain()) {
     try {
       const { response, data } = await fetchJson(
         `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
         {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "x-goog-api-key": key
-          },
+          headers: { "Content-Type": "application/json", "x-goog-api-key": key },
           body: JSON.stringify({
             systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
             contents,
-            generationConfig: {
-              temperature: 0.5,
-              maxOutputTokens: 400
-            }
+            generationConfig: { temperature: 0.45, maxOutputTokens: 320 }
           })
-        },
-        Math.min(GEMINI_TIMEOUT_MS, timeoutMs)
+        }, Math.min(GEMINI_TIMEOUT_MS, timeoutMs)
       );
-
       const status = Number(response.status);
-
       if (response.ok) {
-        const usage = data?.usageMetadata;
-        if (usage) console.log(`Gemini usage (${model}):`, JSON.stringify(usage));
-
-        const candidate = data?.candidates?.[0];
-        const answer = (candidate?.content?.parts || [])
-          .map(part => typeof part.text === "string" ? part.text : "")
-          .join("")
-          .trim();
-
-        if (answer) {
-          console.log(`Gemini succeeded with model: ${model}`);
-          return answer;
-        }
-
+        const answer = (data?.candidates?.[0]?.content?.parts || [])
+          .map(part => typeof part.text === "string" ? part.text : "").join("").trim();
+        if (answer) return answer;
         if (data?.promptFeedback?.blockReason) throw new Error("GEMINI_BLOCKED");
-        console.warn(`Model ${model} returned empty response; trying next.`);
-        lastStatus = "empty";
-        continue;
+      } else {
+        lastStatus = status;
+        if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
+        if (status === 400) throw new Error("GEMINI_BAD_REQUEST");
       }
-
-      console.warn(`Model ${model} failed with HTTP ${status}`);
-      lastStatus = status;
-
-      if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
-      if (status === 400) throw new Error("GEMINI_BAD_REQUEST");
-
-      // 429 и 5xx — повод попробовать следующую модель
-      if (status === 429 || status >= 500) continue;
-
-      // Прочие статусы — не имеет смысла перебирать модели
-      throw new Error("GEMINI_REQUEST_FAILED");
-
-    } catch (err) {
-      if (err.name === "AbortError") {
-        console.warn(`Model ${model} timed out; trying next if budget allows.`);
-        lastStatus = "timeout";
-        continue;
-      }
-      throw err;
+    } catch (error) {
+      if (error.name === "AbortError") { lastStatus = "timeout"; continue; }
+      throw error;
     }
   }
-
   if (lastStatus === 429) throw new Error("GEMINI_QUOTA");
   if (lastStatus === "timeout") throw new Error("TIME_BUDGET_EXHAUSTED");
   throw new Error("GEMINI_REQUEST_FAILED");
@@ -268,81 +224,50 @@ async function askGemini(text, history, searchContext, timeoutMs) {
 
 function errorForUser(error) {
   switch (error?.message) {
-    case "MISSING_GEMINI_KEY":
-      return "Сервер пока не настроен. Проверьте переменную GEMINI_API_KEY в настройках Vercel.";
-    case "GEMINI_KEY_REJECTED":
-      return "Не удалось подключиться к Gemini. Проверьте API-ключ в настройках Vercel.";
-    case "GEMINI_QUOTA":
-      return "Сейчас превышен лимит запросов ко всем моделям Gemini. Попробуйте немного позже.";
-    case "GEMINI_BLOCKED":
-      return "Я не смогла обработать этот запрос. Попробуйте спросить иначе.";
-    case "GEMINI_BAD_REQUEST":
-      return "Нейросеть отклонила запрос из-за формата. Проверьте логи Vercel.";
-    case "TIME_BUDGET_EXHAUSTED":
-    case "AbortError":
-      return "Не успела подготовить ответ. Попробуйте задать вопрос ещё раз, чуть короче.";
-    default:
-      return "Не получилось получить ответ от нейросети. Попробуйте ещё раз чуть позже.";
+    case "MISSING_GEMINI_KEY": return "Сервер пока не настроен. Проверьте GEMINI_API_KEY в Vercel.";
+    case "GEMINI_KEY_REJECTED": return "Не удалось подключиться к Gemini. Проверьте API-ключ в Vercel.";
+    case "GEMINI_QUOTA": return "Превышен лимит Gemini. Попробуйте немного позже.";
+    case "GEMINI_BLOCKED": return "Я не смог обработать этот запрос. Скажи иначе.";
+    case "TIME_BUDGET_EXHAUSTED": return "Я не успела ответить. Скажи короче или повтори вопрос.";
+    default: return "Не получилось получить ответ. Попробуй ещё раз.";
   }
 }
 
 export default async function handler(req, res) {
-  if (req.method === "GET") {
-    return res.status(200).json({
-      ok: true,
-      service: "alice-gemini-serper",
-      message: "Webhook is ready. Yandex Dialogs should send POST requests to /api."
-    });
-  }
-
-  if (req.method !== "POST") {
-    res.setHeader("Allow", "GET, POST");
-    return res.status(405).json({ error: "Method not allowed" });
-  }
+  if (req.method === "GET") return res.status(200).json({ ok: true, service: "alice-jarvis" });
+  if (req.method !== "POST") { res.setHeader("Allow", "GET, POST"); return res.status(405).json({ error: "Method not allowed" }); }
 
   const startedAt = Date.now();
   const remainingMs = () => TOTAL_RESPONSE_BUDGET_MS - (Date.now() - startedAt);
   const body = req.body && typeof req.body === "object" ? req.body : {};
-  const text = String(body?.request?.command || body?.request?.original_utterance || "").trim();
-  const oldHistory = safeHistory(body?.state?.session?.history);
+  const text = cleanText(body?.request?.command || body?.request?.original_utterance || "");
+  const oldHistory = readSessionHistory(body);
 
-  if (!text) {
-    return res.status(200).json(aliceResponse(
-      "Привет! Я могу ответить на вопрос или найти актуальную информацию. Что хочешь узнать?",
-      false,
-      oldHistory
-    ));
-  }
+  if (!text) return res.status(200).json(aliceResponse("Да, Ян, слушаю тебя.", false, oldHistory));
+  if (isHelpRequest(text)) return res.status(200).json(aliceResponse(HELP_TEXT, false, oldHistory));
 
-  if (isHelpRequest(text)) {
-    return res.status(200).json(aliceResponse(HELP_TEXT, false, oldHistory));
+  const quick = quickAnswer(text);
+  if (quick) {
+    const history = [...oldHistory, { role: "user", text }, { role: "model", text: quick }];
+    return res.status(200).json(aliceResponse(quick, false, history));
   }
 
   try {
     let searchContext = "";
-    if (hasSearchIntent(body) && process.env.SERPER_API_KEY) {
-      searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
+    if (hasSearchIntent(body, text) && process.env.SERPER_API_KEY) {
+      searchContext = await searchWeb(text, Math.max(0, remainingMs() - 3100));
     }
-
-    const answer = await askGemini(
-      text,
-      oldHistory,
-      searchContext,
-      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 600))
-    );
-
-    const history = normalizeHistory([
+    const answer = await askGemini(text, oldHistory, searchContext, Math.max(0, remainingMs() - 300));
+    const history = [
       ...oldHistory,
-      { role: "user", text: text.slice(0, MAX_HISTORY_MESSAGE_CHARS) },
-      { role: "model", text: answer.slice(0, MAX_HISTORY_MESSAGE_CHARS) }
-    ].slice(-MAX_HISTORY_MESSAGES));
-
+      { role: "user", text },
+      { role: "model", text: answer }
+    ];
     return res.status(200).json(aliceResponse(answer, false, history));
   } catch (error) {
-    const safeError = error?.message === "AbortError" ? "TIME_BUDGET_EXHAUSTED" : error;
-    console.warn("Alice webhook returned a fallback response:", safeError?.message || "unknown error");
-    return res.status(200).json(aliceResponse(errorForUser(safeError), false, oldHistory));
+    console.warn("Alice webhook error:", error?.message || error);
+    return res.status(200).json(aliceResponse(errorForUser(error), false, oldHistory));
   }
 }
 
-export { aliceResponse, fitAliceText, safeHistory, normalizeHistory, trimHistoryToBudget };
+export { aliceResponse, fitAliceText, safeHistory, normalizeHistory, trimHistoryToBudget, readSessionHistory };
