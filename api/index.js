@@ -11,8 +11,8 @@ const MAX_HISTORY_MESSAGES = 6;
 const MAX_HISTORY_MESSAGE_CHARS = 260;
 const MAX_ALICE_TEXT = 1024;
 const MAX_SESSION_STATE_BYTES = 900;
-const TOTAL_RESPONSE_BUDGET_MS = 4000;
-const SERPER_TIMEOUT_MS = 450;
+const TOTAL_RESPONSE_BUDGET_MS = 5000;
+const SERPER_TIMEOUT_MS = 1200;
 const GEMINI_TIMEOUT_MS = 3000;
 
 const SYSTEM_PROMPT = `
@@ -120,7 +120,19 @@ function aliceResponse(text, endSession = false, history = []) {
 
 function hasSearchIntent(body, text) {
   const intents = body?.request?.nlu?.intents;
-  return Boolean((intents && intents.search) || /\b(найди|поищи|проверь|посмотри в интернете|актуальн|свежие новости|погода|температур|дождь|ветер)\b/i.test(text));
+  // Алиса часто не ставит intent.search на обычные вопросы. Поэтому ищем
+  // автоматически, если вопрос касается текущей ситуации, места, цены,
+  // отзывов, правил или содержит естественные вопросительные конструкции.
+  return Boolean((intents && intents.search) || /\b(найди|поищи|проверь|посмотри в интернете|актуальн|свежие новости|погода|температур|дождь|ветер|сейчас|сегодня|на этой неделе|в севастополе|в крыму|цена|стоимость|отзывы|форум|правил|норма|закон|ловится|работает|продают|купить|какой|какая|какие|сколько|кто|где|когда|можно ли|стоит ли)\b/i.test(text));
+}
+
+function fallbackFromSearch(searchContext) {
+  const clean = cleanText(searchContext)
+    .replace(/https?:\/\/\S+/gi, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+  if (!clean) return "Я не смог получить свежие данные. Попробуй повторить вопрос через несколько секунд.";
+  return `Вот что удалось найти: ${clean.slice(0, 850)}. Если хочешь, я уточню этот вопрос по конкретному источнику.`;
 }
 
 function isHelpRequest(text) {
@@ -299,7 +311,16 @@ export default async function handler(req, res) {
     if (hasSearchIntent(body, text) && process.env.SERPER_API_KEY) {
       searchContext = await searchWeb(text, Math.max(0, remainingMs() - 3100));
     }
-    const answer = await askGemini(text, oldHistory, searchContext, Math.max(0, remainingMs() - 300));
+    let answer;
+    try {
+      answer = await askGemini(text, oldHistory, searchContext, Math.max(0, remainingMs() - 300));
+    } catch (modelError) {
+      // Навык не должен падать, если Gemini временно недоступен.
+      // При наличии результатов поиска отдаём их пользователю напрямую.
+      console.warn("Gemini failed, using resilient fallback:", modelError?.message || modelError);
+      if (searchContext) answer = fallbackFromSearch(searchContext);
+      else throw modelError;
+    }
     const history = [
       ...oldHistory,
       { role: "user", text },
