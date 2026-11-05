@@ -1,8 +1,8 @@
-const DEFAULT_MODEL = "gemini-3.5-flash-lite";
+const DEFAULT_MODEL = "gemini-2.5-flash-lite";
 const FALLBACK_MODELS = [
-  "gemini-3.5-flash-lite",
   "gemini-2.5-flash",
-  "gemini-2.0-flash"
+  "gemini-2.0-flash",
+  "gemini-1.5-flash"
 ];
 
 // Внутри одной сессии храним последние 3 пары вопрос-ответ.
@@ -120,7 +120,7 @@ function aliceResponse(text, endSession = false, history = []) {
 
 function hasSearchIntent(body, text) {
   const intents = body?.request?.nlu?.intents;
-  return Boolean((intents && intents.search) || /\b(найди|поищи|проверь|посмотри в интернете|актуальн|свежие новости)\b/i.test(text));
+  return Boolean((intents && intents.search) || /\b(найди|поищи|проверь|посмотри в интернете|актуальн|свежие новости|погода|температур|дождь|ветер)\b/i.test(text));
 }
 
 function isHelpRequest(text) {
@@ -130,9 +130,28 @@ function isHelpRequest(text) {
 function quickAnswer(text) {
   const q = cleanText(text).toLowerCase();
   if (/^(кто ты|ты кто|как тебя зовут)$/.test(q)) return "Я Джарвис, твой персональный помощник. Я умею отвечать на вопросы, искать свежую информацию и помогать тебе с рабочими и бытовыми задачами.";
+  if (/^(где я|где я нахожусь|мой город|в каком я городе)$/.test(q)) return "Ты находишься в Севастополе.";
   if (/^(привет|здравствуй|доброе утро|добрый день|добрый вечер)$/.test(q)) return "Привет, Ян. Слушаю тебя.";
   if (/^(спасибо|благодарю)$/.test(q)) return "Пожалуйста, Ян.";
   return "";
+}
+
+function isWeatherRequest(text) {
+  return /\b(погода|температур|дождь|осадк|ветер|прогноз)\b/i.test(text);
+}
+
+async function fetchWeather(text, timeoutMs) {
+  if (!isWeatherRequest(text)) return "";
+  const found = text.match(/москв\w*|санкт-петербург|питер|астрахан\w*|ялт\w*|симферопол\w*|севастопол\w*/i);
+  const city = found?.[0] || "Севастополь";
+  try {
+    const url = `https://wttr.in/${encodeURIComponent(city)}?format=j1`;
+    const { response, data } = await fetchJson(url, { headers: { "User-Agent": "alice-jarvis/1.0" } }, Math.min(1800, timeoutMs));
+    if (!response.ok || !data?.current_condition?.[0]) return "";
+    const now = data.current_condition[0];
+    const description = now.lang_ru?.[0]?.value || now.weatherDesc?.[0]?.value || "";
+    return `Сейчас в городе ${city}: ${description}, температура ${now.temp_C} градусов, ощущается как ${now.FeelsLikeC}, ветер ${now.windspeedKmph} километров в час.`;
+  } catch { return ""; }
 }
 
 async function fetchJson(url, options, timeoutMs) {
@@ -253,6 +272,11 @@ export default async function handler(req, res) {
   }
 
   try {
+    const weather = await fetchWeather(text, Math.max(0, remainingMs() - 1800));
+    if (weather) {
+      const history = [...oldHistory, { role: "user", text }, { role: "model", text: weather }];
+      return res.status(200).json(aliceResponse(weather, false, history));
+    }
     let searchContext = "";
     if (hasSearchIntent(body, text) && process.env.SERPER_API_KEY) {
       searchContext = await searchWeb(text, Math.max(0, remainingMs() - 3100));
