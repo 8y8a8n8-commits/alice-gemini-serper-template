@@ -137,21 +137,39 @@ function quickAnswer(text) {
 }
 
 function isWeatherRequest(text) {
-  return /\b(погода|температур|дождь|осадк|ветер|прогноз)\b/i.test(text);
+  // Алиса иногда распознаёт «погода» как «погод» или разбивает фразу на «погод а...».
+  return /погод|температур|дожд|осадк|ветер|прогноз/i.test(text);
 }
 
 async function fetchWeather(text, timeoutMs) {
   if (!isWeatherRequest(text)) return "";
   const found = text.match(/москв\w*|санкт-петербург|питер|астрахан\w*|ялт\w*|симферопол\w*|севастопол\w*/i);
+  // Для первого стабильного варианта используем координаты Севастополя.
+  // Если Алиса склеила город с предыдущим словом, всё равно оставляем город по умолчанию.
   const city = found?.[0] || "Севастополь";
+  const coordinates = {
+    "Севастополь": [44.6167, 33.5254],
+    "севастополь": [44.6167, 33.5254]
+  };
+  const [latitude, longitude] = coordinates[city] || coordinates["Севастополь"];
   try {
-    const url = `https://wttr.in/${encodeURIComponent(city)}?format=j1`;
-    const { response, data } = await fetchJson(url, { headers: { "User-Agent": "alice-jarvis/1.0" } }, Math.min(1800, timeoutMs));
-    if (!response.ok || !data?.current_condition?.[0]) return "";
-    const now = data.current_condition[0];
-    const description = now.lang_ru?.[0]?.value || now.weatherDesc?.[0]?.value || "";
-    return `Сейчас в городе ${city}: ${description}, температура ${now.temp_C} градусов, ощущается как ${now.FeelsLikeC}, ветер ${now.windspeedKmph} километров в час.`;
-  } catch { return ""; }
+    const url = `https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current=temperature_2m,apparent_temperature,weather_code,wind_speed_10m&timezone=Europe%2FMoscow`;
+    const { response, data } = await fetchJson(url, {}, Math.min(2500, timeoutMs));
+    if (!response.ok || !data?.current) return "";
+    const now = data.current;
+    const descriptions = {
+      0: "ясно", 1: "преимущественно ясно", 2: "переменная облачность", 3: "пасмурно",
+      45: "туман", 48: "туман", 51: "небольшой моросящий дождь", 53: "моросящий дождь",
+      55: "сильный моросящий дождь", 61: "небольшой дождь", 63: "дождь", 65: "сильный дождь",
+      71: "небольшой снег", 73: "снег", 75: "сильный снег", 80: "ливневый дождь",
+      81: "ливневый дождь", 82: "сильный ливневый дождь", 95: "гроза"
+    };
+    const description = descriptions[now.weather_code] || "данные о состоянии погоды получены";
+    return `Сейчас в городе ${city}: ${description}. Температура ${now.temperature_2m} градусов, ощущается как ${now.apparent_temperature}, ветер ${now.wind_speed_10m} километров в час.`;
+  } catch (error) {
+    console.warn("Weather request failed:", error?.message || error);
+    return "";
+  }
 }
 
 async function fetchJson(url, options, timeoutMs) {
