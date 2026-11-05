@@ -141,10 +141,12 @@ function isHelpRequest(text) {
 
 function quickAnswer(text) {
   const q = cleanText(text).toLowerCase().replace(/[?!.,]+$/g, "").trim();
+  const compact = q.replace(/\s+/g, "");
   if (/^(кто ты|ты кто|как тебя зовут)$/.test(q)) return "Я Джарвис, твой персональный помощник. Я умею отвечать на вопросы, искать свежую информацию и помогать тебе с рабочими и бытовыми задачами.";
   if (/^(где я|где я нахожусь|мой город|в каком я городе)$/.test(q)) return "Ты находишься в Севастополе.";
   if (/^(кто я|как меня зовут|что ты обо мне знаешь)$/.test(q)) return "Ты Ян. Ты живёшь в Севастополе и работаешь инженером строительного контроля в электромонтажной компании.";
   if (/^(ты тут|ты здесь|алло|алё|джарвис|джарвис ты тут|слышишь меня|на связи)$/.test(q)) return "Да, Ян, я здесь и слушаю тебя.";
+  if (/^ктoя$/.test(compact) || compact === "ктoя" || compact === "ктоя") return "Ты Ян. Ты живёшь в Севастополе и работаешь инженером строительного контроля в электромонтажной компании.";
   if (/^(привет|здравствуй|доброе утро|добрый день|добрый вечер)$/.test(q)) return "Привет, Ян. Слушаю тебя.";
   if (/^(спасибо|благодарю)$/.test(q)) return "Пожалуйста, Ян.";
   return "";
@@ -311,8 +313,17 @@ export default async function handler(req, res) {
       return res.status(200).json(aliceResponse(weather, false, history));
     }
     let searchContext = "";
-    if (hasSearchIntent(body, text) && process.env.SERPER_API_KEY) {
+    const needsSearch = hasSearchIntent(body, text);
+    if (needsSearch && !process.env.SERPER_API_KEY) {
+      const message = "Для актуального ответа нужен ключ SERPER_API_KEY. Добавьте его в Vercel в Settings, Environment Variables и повторите деплой.";
+      return res.status(200).json(aliceResponse(message, false, oldHistory));
+    }
+    if (needsSearch && process.env.SERPER_API_KEY) {
       searchContext = await searchWeb(text, Math.max(0, remainingMs() - 3100));
+    }
+    if (needsSearch && !searchContext) {
+      const message = "Поиск актуальной информации сейчас не вернул данные. Проверьте SERPER_API_KEY в Vercel и повторите последний деплой.";
+      return res.status(200).json(aliceResponse(message, false, oldHistory));
     }
     let answer;
     try {
